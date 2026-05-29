@@ -15,7 +15,7 @@ Attribute VB_Name = "modUpdater"
 Option Explicit
 
 ' Bump only if we ever ship a new version of the updater itself (rare).
-Public Const UPDATER_VERSION As String = "1.1"
+Public Const UPDATER_VERSION As String = "1.2"
 
 ' Source of truth for the latest modGenerateSchedule.bas.
 Private Const UPDATE_URL As String = "https://raw.githubusercontent.com/JJ-San/scheduler-bas-update/main/modGenerateSchedule.bas"
@@ -23,6 +23,15 @@ Private Const TARGET_MODULE As String = "modGenerateSchedule"
 Private Const TARGET_SUB As String = "Sub GenerateSchedule"
 Private Const BUTTON_CAPTION As String = "Check for Updates"
 Private Const BUTTON_NAME As String = "btnCheckUpdates"
+
+' Where the human-visible version label is shown on REPORT_SETTINGS. modUpdater
+' writes here DIRECTLY after a successful update so the cell refreshes
+' immediately, without needing the just-imported modGenerateSchedule to be
+' compiled (Application.Run can't find subs in newly-imported modules until
+' VBA recompiles). modGenerateSchedule.WriteVersionLabel also writes here on
+' every macro run — same cell, two writers, eventually consistent.
+' If the label cell ever moves, update this constant.
+Private Const VERSION_LABEL_CELL As String = "D10"
 
 
 '=============================================================================
@@ -92,12 +101,13 @@ Public Sub CheckForUpdates()
     End If
     On Error GoTo 0
 
-    ' Refresh the on-sheet version label immediately so users see the new
-    ' version without having to click Generate Schedule. Late-bound via
-    ' Application.Run so a future modGenerateSchedule without WriteVersionLabel
-    ' (renamed/removed) doesn't break the update — label just won't refresh.
+    ' Refresh the on-sheet version label immediately so the user sees the new
+    ' version while still looking at the success dialog. Direct write — does NOT
+    ' depend on the just-imported modGenerateSchedule being compiled (it isn't
+    ' yet, so Application.Run "WriteVersionLabel" silently fails here).
     On Error Resume Next
-    Application.Run "WriteVersionLabel"
+    ThisWorkbook.Worksheets("REPORT_SETTINGS").Range(VERSION_LABEL_CELL).Value = _
+        "Workbook Version: " & remoteVer
     On Error GoTo 0
 
     MsgBox "Updated to version " & remoteVer & "." & vbCrLf & vbCrLf & _
