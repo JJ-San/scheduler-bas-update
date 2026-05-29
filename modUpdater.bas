@@ -15,7 +15,7 @@ Attribute VB_Name = "modUpdater"
 Option Explicit
 
 ' Bump only if we ever ship a new version of the updater itself (rare).
-Public Const UPDATER_VERSION As String = "1.0"
+Public Const UPDATER_VERSION As String = "1.1"
 
 ' Source of truth for the latest modGenerateSchedule.bas.
 Private Const UPDATE_URL As String = "https://raw.githubusercontent.com/JJ-San/scheduler-bas-update/main/modGenerateSchedule.bas"
@@ -90,6 +90,14 @@ Public Sub CheckForUpdates()
     If Not VerifyImport() Then
         Err.Raise vbObjectError + 1, "CheckForUpdates", "Verify failed after import"
     End If
+    On Error GoTo 0
+
+    ' Refresh the on-sheet version label immediately so users see the new
+    ' version without having to click Generate Schedule. Late-bound via
+    ' Application.Run so a future modGenerateSchedule without WriteVersionLabel
+    ' (renamed/removed) doesn't break the update — label just won't refresh.
+    On Error Resume Next
+    Application.Run "WriteVersionLabel"
     On Error GoTo 0
 
     MsgBox "Updated to version " & remoteVer & "." & vbCrLf & vbCrLf & _
@@ -227,7 +235,10 @@ Private Function FetchRemote(url As String) As String
     Dim http As Object
     Dim bustedUrl As String
     On Error GoTo HttpFail
-    Set http = CreateObject("MSXML2.XMLHTTP.6.0")
+    ' ServerXMLHTTP uses WinHTTP (not WinINet) — does NOT share IE's local cache,
+    ' so stale-response bugs from previous calls don't haunt us. The cache-buster
+    ' query string below is belt-and-braces for the GitHub CDN edge layer.
+    Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
     bustedUrl = url & "?t=" & CStr(CLng((Now - DateSerial(1970, 1, 1)) * 86400))
     http.Open "GET", bustedUrl, False
     http.setRequestHeader "Cache-Control", "no-cache"
