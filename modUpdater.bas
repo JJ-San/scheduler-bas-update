@@ -2,8 +2,10 @@ Attribute VB_Name = "modUpdater"
 '=============================================================================
 ' MODULE: modUpdater
 ' PURPOSE: Self-update mechanism for the Invoice Schedule macro.
-'          Fetches the latest modGenerateSchedule.bas from a public GitHub URL,
-'          compares versions, and swaps in the new module if newer.
+'          Fetches modGenerateSchedule.bas from a public GitHub URL and swaps
+'          in the server's version whenever it differs from the installed one.
+'          Treats GitHub as source of truth (allows rollbacks, not just forward
+'          updates). MODULE_VERSION is purely metadata for display, not control.
 '
 ' DESIGN:  This module is INTENTIONALLY IMMUTABLE. It never updates itself.
 '          If we ever need to evolve it, that requires a separate manual
@@ -15,7 +17,7 @@ Attribute VB_Name = "modUpdater"
 Option Explicit
 
 ' Bump only if we ever ship a new version of the updater itself (rare).
-Public Const UPDATER_VERSION As String = "1.2"
+Public Const UPDATER_VERSION As String = "1.3"
 
 ' Source of truth for the latest modGenerateSchedule.bas.
 Private Const UPDATE_URL As String = "https://raw.githubusercontent.com/JJ-San/scheduler-bas-update/main/modGenerateSchedule.bas"
@@ -48,11 +50,10 @@ Public Sub CheckForUpdates()
 
     ' 1. Trust access check — cheap, fail fast before any network call.
     If Not VBProjectAccessible() Then
-        MsgBox "Excel needs permission to update the macro." & vbCrLf & vbCrLf & _
-               "To enable: File > Options > Trust Center > Trust Center Settings >" & vbCrLf & _
-               "Macro Settings > tick ""Trust access to the VBA project object model""." & vbCrLf & vbCrLf & _
-               "Then click Check for Updates again.", _
-               vbInformation, "Update Setup Required"
+        MsgBox "Excel needs a one-time permission to install updates. " & _
+               "Please refer to the installation manual for setup steps, " & _
+               "then click Check for Updates again.", _
+               vbInformation, "One-time setup needed"
         Exit Sub
     End If
 
@@ -60,32 +61,33 @@ Public Sub CheckForUpdates()
 
     remoteText = FetchRemote(UPDATE_URL)
     If Len(remoteText) = 0 Then
-        MsgBox "Could not reach the update server." & vbCrLf & _
-               "Check your internet connection and try again later.", _
-               vbExclamation, "Update Unavailable"
+        MsgBox "Couldn't reach the update server. " & _
+               "Check your internet and try again in a few minutes.", _
+               vbExclamation, "Can't reach the server"
         Exit Sub
     End If
 
     remoteVer = ParseVersion(remoteText)
     If Len(remoteVer) = 0 Then
-        MsgBox "The update file from the server doesn't look right." & vbCrLf & _
-               "Please contact support.", _
-               vbCritical, "Update File Invalid"
+        MsgBox "The update file doesn't look right. Try again later. " & _
+               "If it keeps happening, please let your IT or developer know.", _
+               vbCritical, "Hmm, something's off"
         Exit Sub
     End If
 
-    If CompareSemver(installedVer, remoteVer) >= 0 Then
-        MsgBox "You're up to date." & vbCrLf & vbCrLf & _
-               "Current version: " & installedVer, _
-               vbInformation, "No Update Available"
+    ' Equality compare, not semver. GitHub is source of truth: any mismatch
+    ' (forward update OR rollback) prompts the user to apply the server's version.
+    If installedVer = remoteVer Then
+        MsgBox "Your workbook is on the latest version (" & installedVer & ").", _
+               vbInformation, "You're up to date"
         Exit Sub
     End If
 
-    If MsgBox("An update is available." & vbCrLf & vbCrLf & _
-              "Installed version:  " & installedVer & vbCrLf & _
-              "Latest version:     " & remoteVer & vbCrLf & vbCrLf & _
-              "Update now?", _
-              vbYesNo + vbQuestion, "Update Available") <> vbYes Then
+    If MsgBox("A different version of the schedule generator is ready." & vbCrLf & vbCrLf & _
+              "Your version:  " & installedVer & vbCrLf & _
+              "New version:   " & remoteVer & vbCrLf & vbCrLf & _
+              "Install it now?", _
+              vbYesNo + vbQuestion, "Update available") <> vbYes Then
         Exit Sub
     End If
 
@@ -110,9 +112,9 @@ Public Sub CheckForUpdates()
         "Workbook Version: " & remoteVer
     On Error GoTo 0
 
-    MsgBox "Updated to version " & remoteVer & "." & vbCrLf & vbCrLf & _
-           "Please save your workbook now (Ctrl+S) to keep the update.", _
-           vbInformation, "Update Complete"
+    MsgBox "Your workbook is now on version " & remoteVer & "." & vbCrLf & vbCrLf & _
+           "Press Ctrl+S to save and keep this update.", _
+           vbInformation, "Done!"
     Exit Sub
 
 Rollback:
@@ -120,9 +122,10 @@ Rollback:
     RemoveTargetModules
     ThisWorkbook.VBProject.VBComponents.Import backupPath
     On Error GoTo 0
-    MsgBox "The update failed and was rolled back." & vbCrLf & _
-           "Your original macro is intact. Please try again later or contact support.", _
-           vbCritical, "Update Failed"
+    MsgBox "Something went wrong, so your original version is still in place. " & _
+           "Try again in a moment. If it keeps failing, " & _
+           "let your IT or developer know.", _
+           vbCritical, "Couldn't update"
 End Sub
 
 
@@ -216,27 +219,6 @@ Private Function ParseVersion(text As String) As String
     Else
         ParseVersion = ""
     End If
-End Function
-
-' Compares semver-style "X.Y" strings. -1 if a<b, 0 equal, 1 if a>b.
-' Parts compared as integers so "2.10" > "2.9" works correctly.
-Private Function CompareSemver(a As String, b As String) As Long
-    Dim partsA() As String, partsB() As String
-    Dim i As Long, maxLen As Long
-    Dim ai As Long, bi As Long
-
-    partsA = Split(a, ".")
-    partsB = Split(b, ".")
-    maxLen = WorksheetFunction.Max(UBound(partsA), UBound(partsB))
-
-    For i = 0 To maxLen
-        ai = 0: bi = 0
-        If i <= UBound(partsA) Then ai = CLng(Val(partsA(i)))
-        If i <= UBound(partsB) Then bi = CLng(Val(partsB(i)))
-        If ai < bi Then CompareSemver = -1: Exit Function
-        If ai > bi Then CompareSemver = 1: Exit Function
-    Next i
-    CompareSemver = 0
 End Function
 
 ' Fetches a URL via MSXML2.XMLHTTP. Returns "" on any failure.
