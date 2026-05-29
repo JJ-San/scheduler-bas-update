@@ -8,7 +8,12 @@ Option Explicit
 
 ' Read by modUpdater.CheckForUpdates to decide whether a newer release exists.
 ' Bump on every release. Keep the format "MAJOR.MINOR" so semver compare works.
-Public Const MODULE_VERSION As String = "2.0"
+Public Const MODULE_VERSION As String = "2.1"
+
+' Cell on REPORT_SETTINGS where the human-visible version label lives.
+' WriteVersionLabel writes "Workbook Version: X.Y" here every time GenerateSchedule
+' runs, so the label always reflects the loaded macro. Move the cell? Update this constant.
+Public Const VERSION_CELL As String = "D10"
 
 Private Const FONT_NAME As String = "Aptos"
 Private Const FONT_SIZE As Double = 9
@@ -49,8 +54,18 @@ Private mContrCount As Long
 
 ' ============================= PUBLIC MACROS ================================
 
+' Writes "Workbook Version: X.Y" to the version label cell on REPORT_SETTINGS.
+' Called at the top of GenerateSchedule (so every regenerate refreshes the label)
+' and by modUpdater after a successful update (so the label refreshes immediately).
+Public Sub WriteVersionLabel()
+    On Error Resume Next
+    ThisWorkbook.Worksheets("REPORT_SETTINGS").Range(VERSION_CELL).Value = _
+        "Workbook Version: " & MODULE_VERSION
+End Sub
+
 Public Sub GenerateSchedule()
 
+    WriteVersionLabel
     Application.ScreenUpdating = False
     Application.Calculation = xlCalculationManual
     ' Section + row trackers are declared early so the error handler always
