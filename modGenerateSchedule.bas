@@ -1651,7 +1651,7 @@ Private Sub WriteInvoiceHeader(ws As Worksheet, rowNum As Long)
                 "AMOUNT" & vbLf & "ex GST", _
                 "CUMULATIVE" & vbLf & "ex GST", _
                 "AMOUNT" & vbLf & "inc GST", _
-                "CUMULATIVE", _
+                "CUMULATIVE" & vbLf & "inc GST", _
                 "", "COMMITTED" & vbLf & "AMOUNT"
 End Sub
 
