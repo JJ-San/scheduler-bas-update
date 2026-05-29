@@ -17,7 +17,7 @@ Attribute VB_Name = "modUpdater"
 Option Explicit
 
 ' Bump only if we ever ship a new version of the updater itself (rare).
-Public Const UPDATER_VERSION As String = "1.3"
+Public Const UPDATER_VERSION As String = "1.4"
 
 ' Source of truth for the latest modGenerateSchedule.bas.
 Private Const UPDATE_URL As String = "https://raw.githubusercontent.com/JJ-San/scheduler-bas-update/main/modGenerateSchedule.bas"
@@ -92,10 +92,18 @@ Public Sub CheckForUpdates()
     End If
 
     ' Backup + swap + verify, with rollback on any failure between here and success.
-    backupPath = BackupModule()
-    tmpPath = WriteTempBas(remoteText)
+    ' Error handler armed BEFORE BackupModule/WriteTempBas so a failure in those
+    ' steps (no module present, %TEMP% not writable, disk full) shows our friendly
+    ' message instead of a raw VBA error popup. `destructive` tracks whether we've
+    ' actually mutated the workbook yet, so Rollback doesn't pointlessly remove+
+    ' reimport when the failure was BEFORE any change happened.
+    Dim destructive As Boolean
+    destructive = False
 
     On Error GoTo Rollback
+    backupPath = BackupModule()
+    tmpPath = WriteTempBas(remoteText)
+    destructive = True
     RemoveTargetModules
     ThisWorkbook.VBProject.VBComponents.Import tmpPath
     If Not VerifyImport() Then
@@ -119,8 +127,12 @@ Public Sub CheckForUpdates()
 
 Rollback:
     On Error Resume Next
-    RemoveTargetModules
-    ThisWorkbook.VBProject.VBComponents.Import backupPath
+    If destructive Then
+        RemoveTargetModules
+        If Len(backupPath) > 0 Then
+            ThisWorkbook.VBProject.VBComponents.Import backupPath
+        End If
+    End If
     On Error GoTo 0
     MsgBox "Something went wrong, so your original version is still in place. " & _
            "Try again in a moment. If it keeps failing, " & _
@@ -233,6 +245,9 @@ Private Function FetchRemote(url As String) As String
     Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
     bustedUrl = url & "?t=" & CStr(CLng((Now - DateSerial(1970, 1, 1)) * 86400))
     http.Open "GET", bustedUrl, False
+    ' setTimeouts: resolve, connect, send, receive (ms). Total worst case ~30s
+    ' so Excel never hangs indefinitely on a slow/dead network.
+    http.setTimeouts 5000, 5000, 5000, 15000
     http.setRequestHeader "Cache-Control", "no-cache"
     http.send
     If http.Status = 200 Then
@@ -282,8 +297,9 @@ Private Function WriteTempBas(text As String) As String
     WriteTempBas = path
 End Function
 
-' Removes all VBComponents whose Name starts with TARGET_MODULE and Type=1.
-' Two-pass to avoid skipping items when mutating a live collection.
+' Removes the modGenerateSchedule code module (and any duplicate-import
+' collision variants like modGenerateSchedule1). Two-pass to avoid skipping
+' items when mutating a live collection.
 Private Sub RemoveTargetModules()
     Dim cmp As Object
     Dim toRemove As Collection
@@ -291,7 +307,7 @@ Private Sub RemoveTargetModules()
     Set toRemove = New Collection
     For Each cmp In ThisWorkbook.VBProject.VBComponents
         If cmp.Type = 1 Then
-            If Left$(cmp.Name, Len(TARGET_MODULE)) = TARGET_MODULE Then
+            If IsTargetModuleName(cmp.Name) Then
                 toRemove.Add cmp
             End If
         End If
@@ -300,6 +316,22 @@ Private Sub RemoveTargetModules()
         ThisWorkbook.VBProject.VBComponents.Remove toRemove(i)
     Next i
 End Sub
+
+' True for "modGenerateSchedule" (exact) or "modGenerateSchedule<digits>"
+' (Excel's auto-rename for duplicate imports — modGenerateSchedule1, etc).
+' Does NOT match "modGenerateScheduleHelper" or similar — protects unrelated
+' modules from being accidentally swept up.
+Private Function IsTargetModuleName(name As String) As Boolean
+    If name = TARGET_MODULE Then
+        IsTargetModuleName = True
+        Exit Function
+    End If
+    If Left$(name, Len(TARGET_MODULE)) = TARGET_MODULE Then
+        Dim suffix As String
+        suffix = Mid$(name, Len(TARGET_MODULE) + 1)
+        IsTargetModuleName = (Len(suffix) > 0 And IsNumeric(suffix))
+    End If
+End Function
 
 ' Confirms the new modGenerateSchedule was imported and contains GenerateSchedule.
 Private Function VerifyImport() As Boolean
