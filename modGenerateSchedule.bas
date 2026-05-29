@@ -8,7 +8,7 @@ Option Explicit
 
 ' Read by modUpdater.CheckForUpdates to decide whether a newer release exists.
 ' Bump on every release. Keep the format "MAJOR.MINOR" so semver compare works.
-Public Const MODULE_VERSION As String = "2.0"
+Public Const MODULE_VERSION As String = "2.1"
 
 ' Cell on REPORT_SETTINGS where the human-visible version label lives.
 ' WriteVersionLabel writes "Workbook Version: X.Y" here every time GenerateSchedule
@@ -1647,7 +1647,7 @@ End Sub
 ' ========================= HEADER WRITERS ===================================
 
 Private Sub WriteInvoiceHeader(ws As Worksheet, rowNum As Long)
-    WriteHeader ws, rowNum, "COMPANY", "DATE", "INV No.", _
+    WriteHeader ws, rowNum, "COMPANIES", "DATE", "INV No.", _
                 "AMOUNT" & vbLf & "ex GST", _
                 "CUMULATIVE" & vbLf & "ex GST", _
                 "AMOUNT" & vbLf & "inc GST", _
