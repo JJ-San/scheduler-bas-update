@@ -17,7 +17,7 @@ Attribute VB_Name = "modUpdater"
 Option Explicit
 
 ' Bump only if we ever ship a new version of the updater itself (rare).
-Public Const UPDATER_VERSION As String = "1.4"
+Public Const UPDATER_VERSION As String = "1.5"
 
 ' Source of truth for the latest modGenerateSchedule.bas.
 Private Const UPDATE_URL As String = "https://raw.githubusercontent.com/JJ-San/scheduler-bas-update/main/modGenerateSchedule.bas"
@@ -218,13 +218,17 @@ End Function
 
 ' Parses Public Const MODULE_VERSION As String = "X.Y" out of a text blob.
 ' Tolerant of whitespace; case-insensitive on keywords.
+' Anchored to start of line (MultiLine mode) so a comment containing the same
+' literal text (e.g. a deprecation note) doesn't get matched ahead of the real
+' constant declaration. Comments start with apostrophe so they fail the anchor.
 Private Function ParseVersion(text As String) As String
     Dim re As Object
     Dim m As Object
     Set re = CreateObject("VBScript.RegExp")
-    re.Pattern = "Public\s+Const\s+MODULE_VERSION\s+As\s+String\s*=\s*""([^""]+)"""
+    re.Pattern = "^\s*Public\s+Const\s+MODULE_VERSION\s+As\s+String\s*=\s*""([^""]+)"""
     re.IgnoreCase = True
     re.Global = False
+    re.MultiLine = True
     Set m = re.Execute(text)
     If m.Count > 0 Then
         ParseVersion = m(0).SubMatches(0)
@@ -274,11 +278,23 @@ Private Function StripBOM(text As String) As String
 End Function
 
 ' Exports current modGenerateSchedule to %TEMP%\modGenerateSchedule_backup_<TS>.bas
+' Returns "" if there's no current module to back up (e.g., a previous rollback
+' itself failed and left the workbook with no modGenerateSchedule). Returning ""
+' lets CheckForUpdates proceed with the import anyway, recovering the workbook
+' from scratch instead of getting permanently stuck on every subsequent click.
 Private Function BackupModule() As String
+    Dim cmp As Object
+    On Error Resume Next
+    Set cmp = ThisWorkbook.VBProject.VBComponents(TARGET_MODULE)
+    On Error GoTo 0
+    If cmp Is Nothing Then
+        BackupModule = ""
+        Exit Function
+    End If
     Dim path As String
     path = Environ$("TEMP") & "\modGenerateSchedule_backup_" & _
            Format(Now, "yyyymmdd_hhnnss") & ".bas"
-    ThisWorkbook.VBProject.VBComponents(TARGET_MODULE).Export path
+    cmp.Export path
     BackupModule = path
 End Function
 
