@@ -8,7 +8,7 @@ Option Explicit
 
 ' Read by modUpdater.CheckForUpdates to decide whether a newer release exists.
 ' Bump on every release. Keep the format "MAJOR.MINOR" so semver compare works.
-Public Const MODULE_VERSION As String = "2.2"
+Public Const MODULE_VERSION As String = "2.3"
 
 ' Cell on REPORT_SETTINGS where the human-visible version label lives.
 ' WriteVersionLabel writes "Workbook Version: X.Y" here every time GenerateSchedule
@@ -1652,7 +1652,7 @@ Private Sub WriteInvoiceHeader(ws As Worksheet, rowNum As Long)
                 "CUMULATIVE" & vbLf & "ex GST", _
                 "AMOUNT" & vbLf & "inc GST", _
                 "CUMULATIVE" & vbLf & "inc GST", _
-                "", "COMMITTED"
+                "", "COMMITTED" & vbLf & "AMOUNT"
 End Sub
 
 Private Sub WriteContractorHeader(ws As Worksheet, rowNum As Long, contrName As String)
@@ -1664,7 +1664,7 @@ Private Sub WriteContractorHeader(ws As Worksheet, rowNum As Long, contrName As 
     End If
     WriteHeader ws, rowNum, colAText, "DATE", _
                 "PROGRESS PAYMENT NO.", "VALUE OF WORK COMPLETED", "RETENTIONS", _
-                "VALUE LESS RETENTIONS LESS PREVIOUS", "PAYMENT DUE INCL GST", "", "COMMITTED"
+                "VALUE LESS RETENTIONS LESS PREVIOUS", "PAYMENT DUE INCL GST", "", "COMMITTED" & vbLf & "AMOUNT"
     ws.Rows(rowNum).RowHeight = 43.2  ' 72 pixels for contractor headers
 End Sub
 
