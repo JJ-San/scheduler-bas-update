@@ -32,6 +32,13 @@ Macro is swapped in place; user saves the workbook
 3. `git push origin main` (manual, always).
 4. Notify the team with a one-line email: *"Update X.Y is out: <change>. Click Check for Updates."*
 
+## ⚠ Burned version numbers: 3.1, 3.2
+
+Both were briefly live on 2026-07-27 during Update 3 development, before any
+announcement. **Never reuse them**: the updater is an equality compare, so a
+workbook stamped with a burned number would report "up to date" against a
+reused release and silently skip it. The next release after 3.0 is **3.3**.
+
 ## ⚠ Rollbacks: FIX FORWARD ONLY (since 3.0)
 
 Since 3.0 the module migrates workbook schema in place (`EnsureSchema`): 3.0 reordered the COMMITTED sheet (DISCIPLINE inserted at column B). A pre-3.0 module running on a migrated workbook mis-reads that layout — fee items parse as company names — so **never push a module older than 3.0 to `main`**. To undo a bad release, publish a *forward* commit with a **higher** version that reverts the behaviour. (The `Roll back to 2.0…` commits in this log predate schema migrations and were safe then; that door is now closed.)

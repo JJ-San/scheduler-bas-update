@@ -8,14 +8,14 @@ Option Explicit
 
 ' Read by modUpdater.CheckForUpdates to decide whether a newer release exists.
 ' Bump on every release. Keep the format "MAJOR.MINOR" so semver compare works.
-Public Const MODULE_VERSION As String = "3.1"
+Public Const MODULE_VERSION As String = "3.0"
 
 ' Input-sheet layout generation this module expects. EnsureSchema upgrades
 ' older workbooks in place (idempotent, additive-only) on the first Generate
 ' after a module update; the workbook's current generation is stamped in the
 ' hidden defined name "SchemaVersion". Bump ONLY when the entry-sheet schema
 ' changes, and add a matching migration step to EnsureSchema.
-Public Const SCHEMA_VERSION As Long = 4
+Public Const SCHEMA_VERSION As Long = 5
 
 ' Cell on REPORT_SETTINGS where the human-visible version label lives.
 ' WriteVersionLabel writes "Workbook Version: X.Y" here every time GenerateSchedule
@@ -93,8 +93,9 @@ Private Sub EnsureSchema()
     Set wsCF = ThisWorkbook.Sheets("COMMITTED")
 
     ' --- Migration 3 (Update 3): release column + discipline column ---
+    Dim ceHdr As String: ceHdr = UCase(Trim(CStr(wsCE.Range("G1").Value)))
     Dim needCE As Boolean, needCF As Boolean
-    needCE = (UCase(Trim(CStr(wsCE.Range("G1").Value))) <> "RETENTION RELEASE $")
+    needCE = (ceHdr <> "RETENTION RELEASE ($ OR %)" And ceHdr <> "RETENTION RELEASE $")
     needCF = (UCase(Trim(CStr(wsCF.Range("B1").Value))) <> "DISCIPLINE")
 
     ' Safety copy before the first structural touch (freshly built workbooks
@@ -112,7 +113,7 @@ Private Sub EnsureSchema()
         wsCE.Range("F1").Copy
         wsCE.Range("G1").PasteSpecial xlPasteFormats
         Application.CutCopyMode = False
-        wsCE.Range("G1").Value = "RETENTION RELEASE $"
+        wsCE.Range("G1").Value = "RETENTION RELEASE ($ or %)"
         wsCE.Columns("G").ColumnWidth = 16
         ' Fold the new column into the sheet's entry Table if one exists
         On Error Resume Next
@@ -147,6 +148,12 @@ Private Sub EnsureSchema()
         On Error Resume Next
         wsCF.Columns("B").Validation.Delete
         On Error GoTo Bail
+    End If
+
+    ' --- Migration 5 (3.2): the release column now accepts $ or % — rename
+    '     the header on workbooks migrated before the rename. ---
+    If UCase(Trim(CStr(wsCE.Range("G1").Value))) = "RETENTION RELEASE $" Then
+        wsCE.Range("G1").Value = "RETENTION RELEASE ($ or %)"
     End If
 
     ' The retention guard (COMMITTED sheet module) hardcodes its column, so a
@@ -883,24 +890,32 @@ Public Sub GenerateSchedule()
             Dim ctrStartRow As Long, ctrCount As Long
             ctrStartRow = curRow: ctrCount = 0
             Dim retFormula As String
-            Dim ctrRelCum As Double: ctrRelCum = 0   ' retention released so far (this contractor)
+            ' Releases so far, kept as an Excel EXPRESSION ("2500+E9*.5") so
+            ' every balance stays a sheet-auditable formula, never a number
+            ' baked in VBA. Reset per contractor.
+            Dim relSumExpr As String: relSumExpr = ""
 
             ' Write contractor progress payments from CLAIM_ENTRY
             For i = 1 To UBound(claimArr, 1)
                 If CStr(claimArr(i, 1)) = contrName Then
                     Dim isPaidCtr As Boolean
                     isPaidCtr = (UCase(Trim(CStr(claimArr(i, 5)))) = "Y")
-                    ' Release row = an amount in CLAIM_ENTRY col G ("Retention Release $").
-                    ' On a release no new work is claimed: the work value is carried
-                    ' forward and the retention balance drops by the released amount,
-                    ' so the existing col-F formula pays the release out and it flows
-                    ' into the construction totals untouched.
+                    ' Release row = a value in CLAIM_ENTRY col G ("Retention Release $"):
+                    '   > 1        a dollar amount
+                    '   0 < v <= 1 a percentage of the balance currently held
+                    '              (Excel stores a typed "50%" as 0.5)
+                    '   negative   a correction: re-holds previously released
+                    '              retention (same convention as negative
+                    '              refund invoices elsewhere in the workbook)
+                    ' Value of Work is always entered as per the claim — restated on a
+                    ' pure release, increased when a claim and a release share a row.
+                    ' The balance drops by the release, so the existing col-F formula
+                    ' pays it out and it flows into the construction totals untouched.
                     Dim relAmt As Double: relAmt = 0
                     If UBound(claimArr, 2) >= 7 Then
                         If IsNumeric(claimArr(i, 7)) Then relAmt = CDbl(claimArr(i, 7))
                     End If
                     Dim isRelease As Boolean: isRelease = (relAmt <> 0)
-                    If isRelease Then ctrRelCum = ctrRelCum + relAmt
                     If Not isPaidCtr Then
                         wsPay.Cells(curRow, 1).Value = "Invoice recommended for payment"
                         wsPay.Range(wsPay.Cells(curRow, 1), wsPay.Cells(curRow, 7)).Interior.Color = UNPAID_FILL
@@ -909,16 +924,25 @@ Public Sub GenerateSchedule()
                     wsPay.Cells(curRow, 2).NumberFormatLocal =DATE_FMT
                     wsPay.Cells(curRow, 3).NumberFormatLocal ="@"
                     wsPay.Cells(curRow, 3).Value = CStr(claimArr(i, 3))
-                    If isRelease And ctrCount > 0 Then
-                        ' No new work on a release — carry the cumulative value forward
-                        wsPay.Cells(curRow, 4).Formula = "=D" & (curRow - 1)
-                    Else
-                        ' Release as a contractor's FIRST row is invalid input; falls
-                        ' through here so the nonsense (negative balance) stays visible
-                        ' rather than being silently ignored.
-                        wsPay.Cells(curRow, 4).Value = claimArr(i, 4)
-                    End If
+                    ' Entered value used as-is on every row — release rows restate
+                    ' the completed value. A blank on a release row renders as an
+                    ' obviously-wrong negative balance rather than being papered over.
+                    wsPay.Cells(curRow, 4).Value = claimArr(i, 4)
                     wsPay.Cells(curRow, 4).NumberFormatLocal =MONEY_FMT
+                    If isRelease Then
+                        Dim thisRel As String
+                        If relAmt > 0 And relAmt <= 1 And ctrCount > 0 Then
+                            ' Percentage of the balance held = the row above's E
+                            thisRel = "E" & (curRow - 1) & "*" & Trim$(Str$(relAmt))
+                        Else
+                            thisRel = Trim$(Str$(relAmt))
+                        End If
+                        If Len(relSumExpr) = 0 Then
+                            relSumExpr = thisRel
+                        Else
+                            relSumExpr = relSumExpr & "+" & thisRel
+                        End If
+                    End If
                     Select Case retentionType
                         Case "Minor Works"
                             retFormula = "=0"
@@ -935,19 +959,13 @@ Public Sub GenerateSchedule()
                                          "IF(D" & curRow & "<1000000,10000+(D" & curRow & "-200000)*0.025," & _
                                          "30000+(D" & curRow & "-1000000)*0.0087)),200000),2)"
                     End Select
-                    ' Retention balance held. Str$ (not CStr) for the appended literals:
-                    ' it always renders a period decimal, which .Formula requires
-                    ' regardless of the machine's locale.
-                    If isRelease Then
-                        If ctrCount > 0 Then
-                            wsPay.Cells(curRow, 5).Formula = "=E" & (curRow - 1) & "-" & Trim$(Str$(relAmt))
-                        Else
-                            wsPay.Cells(curRow, 5).Formula = "=0-" & Trim$(Str$(relAmt))
-                        End If
-                    ElseIf ctrRelCum > 0 Then
-                        ' Claims after a release: net off retention already paid back
-                        ' out, so released money is never quietly re-held.
-                        wsPay.Cells(curRow, 5).Formula = retFormula & "-" & Trim$(Str$(ctrRelCum))
+                    ' Balance held = tier retention on cumulative work MINUS all
+                    ' releases so far. One shape for every row (plain claims,
+                    ' releases, combined claim+release), so released retention is
+                    ' never re-held. Str$ (not CStr) for literals: it always renders
+                    ' a period decimal, which .Formula requires regardless of locale.
+                    If Len(relSumExpr) > 0 Then
+                        wsPay.Cells(curRow, 5).Formula = retFormula & "-(" & relSumExpr & ")"
                     Else
                         wsPay.Cells(curRow, 5).Formula = retFormula
                     End If
