@@ -8,14 +8,14 @@ Option Explicit
 
 ' Read by modUpdater.CheckForUpdates to decide whether a newer release exists.
 ' Bump on every release. Keep the format "MAJOR.MINOR" so semver compare works.
-Public Const MODULE_VERSION As String = "3.0"
+Public Const MODULE_VERSION As String = "3.1"
 
 ' Input-sheet layout generation this module expects. EnsureSchema upgrades
 ' older workbooks in place (idempotent, additive-only) on the first Generate
 ' after a module update; the workbook's current generation is stamped in the
 ' hidden defined name "SchemaVersion". Bump ONLY when the entry-sheet schema
 ' changes, and add a matching migration step to EnsureSchema.
-Public Const SCHEMA_VERSION As Long = 3
+Public Const SCHEMA_VERSION As Long = 4
 
 ' Cell on REPORT_SETTINGS where the human-visible version label lives.
 ' WriteVersionLabel writes "Workbook Version: X.Y" here every time GenerateSchedule
@@ -136,6 +136,17 @@ Private Sub EnsureSchema()
         Application.CutCopyMode = False
         wsCF.Range("B1").Value = "DISCIPLINE"
         wsCF.Columns("B").ColumnWidth = 18
+    End If
+
+    ' --- Migration 4 (3.1 repair): a column insert INHERITS the left
+    '     neighbour's data validation, so 3.0's migration gave DISCIPLINE the
+    '     TYPE dropdown. Strip any validation from col B — discipline is free
+    '     text. Runs for fresh migrations (right after the insert above) AND
+    '     heals workbooks already migrated by 3.0. Idempotent. ---
+    If UCase(Trim(CStr(wsCF.Range("B1").Value))) = "DISCIPLINE" Then
+        On Error Resume Next
+        wsCF.Columns("B").Validation.Delete
+        On Error GoTo Bail
     End If
 
     ' The retention guard (COMMITTED sheet module) hardcodes its column, so a
