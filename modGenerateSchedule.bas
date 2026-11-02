@@ -6,16 +6,21 @@ Attribute VB_Name = "modGenerateSchedule"
 
 Option Explicit
 
-' Read by modUpdater.CheckForUpdates to decide whether a newer release exists.
-' Bump on every release. Keep the format "MAJOR.MINOR" so semver compare works.
-Public Const MODULE_VERSION As String = "3.0"
+' Read by modUpdater.CheckForUpdates to decide whether a different release
+' exists. EQUALITY compare (any mismatch prompts); tmp/release.py separately
+' enforces forward-only numbering. Format "MAJOR.MINOR": each client update is a
+' whole number (Update 4 = 4.0), fixes after a release take the decimal (4.1).
+' Trial and test builds carry a label ("4.0-trial") that release.py refuses to
+' publish. Never reuse a burned number (see CLAUDE.md) - equality would skip it.
+Public Const MODULE_VERSION As String = "4.0"
 
 ' Input-sheet layout generation this module expects. EnsureSchema upgrades
 ' older workbooks in place (idempotent, additive-only) on the first Generate
 ' after a module update; the workbook's current generation is stamped in the
 ' hidden defined name "SchemaVersion". Bump ONLY when the entry-sheet schema
 ' changes, and add a matching migration step to EnsureSchema.
-Public Const SCHEMA_VERSION As Long = 5
+' 6 (Update 4): RETENTION CAP ($) on COMMITTED col H (migration 6).
+Public Const SCHEMA_VERSION As Long = 6
 
 ' Cell on REPORT_SETTINGS where the human-visible version label lives.
 ' WriteVersionLabel writes "Workbook Version: X.Y" here every time GenerateSchedule
@@ -93,14 +98,20 @@ Private Sub EnsureSchema()
     Set wsCF = ThisWorkbook.Sheets("COMMITTED")
 
     ' --- Migration 3 (Update 3): release column + discipline column ---
-    Dim ceHdr As String: ceHdr = UCase(Trim(CStr(wsCE.Range("G1").Value)))
+    ' Header compares are whitespace-tolerant (NormHdr): users legitimately
+    ' Alt+Enter headers to wrap them, and that must not read as "missing".
+    Dim ceHdr As String: ceHdr = NormHdr(wsCE.Range("G1").Value)
     Dim needCE As Boolean, needCF As Boolean
     needCE = (ceHdr <> "RETENTION RELEASE ($ OR %)" And ceHdr <> "RETENTION RELEASE $")
-    needCF = (UCase(Trim(CStr(wsCF.Range("B1").Value))) <> "DISCIPLINE")
+    needCF = (NormHdr(wsCF.Range("B1").Value) <> "DISCIPLINE")
+    ' Migration 6: a schema-5 workbook has needCE = needCF = False, so the cap
+    ' column must take part in the backup decision itself
+    Dim needCap As Boolean
+    needCap = (NormHdr(wsCF.Range("H1").Value) <> "RETENTION CAP ($)")
 
     ' Safety copy before the first structural touch (freshly built workbooks
     ' skip straight to the stamp). Backup failure never blocks the migration.
-    If needCE Or needCF Then
+    If needCE Or needCF Or needCap Then
         On Error Resume Next
         ThisWorkbook.SaveCopyAs Environ$("TEMP") & "\" & _
             Replace(ThisWorkbook.Name, ".xlsm", "") & "_preSchema" & _
@@ -152,13 +163,79 @@ Private Sub EnsureSchema()
 
     ' --- Migration 5 (3.2): the release column now accepts $ or % — rename
     '     the header on workbooks migrated before the rename. ---
-    If UCase(Trim(CStr(wsCE.Range("G1").Value))) = "RETENTION RELEASE $" Then
+    If NormHdr(wsCE.Range("G1").Value) = "RETENTION RELEASE $" Then
         wsCE.Range("G1").Value = "RETENTION RELEASE ($ or %)"
     End If
 
+    ' --- Migration 6 (Update 4): per-contractor retention cap, COMMITTED col H ---
+    If needCap Then
+        ' The below-table note ("Drag blue corner down" / "to add more rows to
+        ' the table") lives in col H, sometimes on rows inside the data range.
+        ' Move it to col I on the same row first (only when I is empty) so it
+        ' never sits in the cap column.
+        Dim nRow As Long, nTxt As String
+        For nRow = 2 To 600
+            nTxt = ""
+            If Not IsError(wsCF.Cells(nRow, 8).Value) Then nTxt = LCase(Trim(CStr(wsCF.Cells(nRow, 8).Value)))
+            If Left$(nTxt, 16) = "drag blue corner" Or Left$(nTxt, 16) = "to add more rows" Then
+                If IsEmpty(wsCF.Cells(nRow, 9).Value) Then
+                    wsCF.Cells(nRow, 8).Cut Destination:=wsCF.Cells(nRow, 9)
+                End If
+            End If
+        Next nRow
+
+        ' Header styled like RETENTIONS. The value goes in BEFORE the Table
+        ' resize, otherwise Excel names the new column "Column1". If the Table
+        ' already grew into H (typing in H auto-extends it), this renames it.
+        wsCF.Range("G1").Copy
+        wsCF.Range("H1").PasteSpecial xlPasteFormats
+        Application.CutCopyMode = False
+        wsCF.Range("H1").Value = "RETENTION CAP ($)"
+        wsCF.Columns("H").ColumnWidth = 16
+
+        ' Fold the new column into the entry Table if it stops short of H
+        On Error Resume Next
+        If wsCF.ListObjects.Count > 0 Then
+            Dim loCF As Object: Set loCF = wsCF.ListObjects(1)
+            If loCF.Range.Column + loCF.Range.Columns.Count - 1 < 8 Then
+                loCF.Resize wsCF.Range(loCF.Range.Cells(1, 1), _
+                    wsCF.Cells(loCF.Range.Row + loCF.Range.Rows.Count - 1, 8))
+            End If
+        End If
+        On Error GoTo Bail
+
+        ' Dollars only: Delete first (Add raises 1004 over existing
+        ' validation). A typed 5% arrives as 0.05 and is rejected.
+        With wsCF.Range("H2:H502").Validation
+            .Delete
+            .Add Type:=xlValidateDecimal, AlertStyle:=xlValidAlertStop, _
+                 Operator:=xlGreaterEqual, Formula1:="1"
+            .IgnoreBlank = True
+            .ErrorTitle = "Retention cap"
+            .ErrorMessage = "Enter the cap in dollars (for example 30000), or leave blank for no cap."
+        End With
+        wsCF.Range("H2:H502").NumberFormatLocal = MONEY_FMT_WHOLE
+    End If
+
+    ' CommittedCompanies (company dropdowns on CLAIM_ENTRY col A and
+    ' FEES_ENTRY col B) must point at COMMITTED col C. Outside the needCap
+    ' guard so it also heals already-migrated workbooks. Check-before-do:
+    ' any end row on col C is left alone (row inserts legitimately grow it
+    ' past 490); only a reference off col C (the stale $B$23:$B$490 dev
+    ' artefact) is repointed.
+    On Error Resume Next
+    Dim ccRef As String: ccRef = ""
+    ccRef = Replace(ThisWorkbook.Names("CommittedCompanies").RefersTo, "'", "")
+    If Len(ccRef) > 0 Then
+        If Not (ccRef Like "=COMMITTED!$C$2:$C$*") Then
+            ThisWorkbook.Names("CommittedCompanies").RefersTo = "=COMMITTED!$C$2:$C$490"
+        End If
+    End If
+    On Error GoTo Bail
+
     ' The retention guard (COMMITTED sheet module) hardcodes its column, so a
-    ' column shift strands it — refresh it to col G. Needs VBA project access,
-    ' which Check for Updates users already have. If unavailable, leave the
+    ' column shift strands it, so refresh it to cols G:H (retention type and
+    ' cap). Needs VBA project access, which Check for Updates users already have. If unavailable, leave the
     ' schema unstamped so the whole (idempotent) migration retries next run.
     If Not InstallRetentionGuard() Then
         LogMacroNote "EnsureSchema: retention guard deferred - VBA project access unavailable"
@@ -172,6 +249,32 @@ Bail:
     ' legacy shim keeps unmigrated workbooks fully functional.
     LogMacroNote "EnsureSchema: bailed - Err " & Err.Number & " " & Err.Description
 End Sub
+
+' Header text normalised for comparison: uppercased, line breaks flattened,
+' runs of whitespace collapsed. Users Alt+Enter headers for display; that
+' formatting must never be mistaken for a schema difference.
+Private Function NormHdr(v As Variant) As String
+    Dim s As String
+    s = UCase(Trim(CStr(v)))
+    s = Replace(Replace(s, vbCr, " "), vbLf, " ")
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    NormHdr = s
+End Function
+
+' COMMITTED TYPE -> canonical spelling of one of the six known types (Trim,
+' whitespace runs collapsed, case-insensitive). Anything else, blank included,
+' returns "" so the auto-fill treats it as undetected instead of an explicit
+' TYPE that no section would ever render (item 15: explicit TYPE wins).
+Private Function CanonType(v As Variant) As String
+    Dim s As String, t As Variant
+    s = NormHdr(v)
+    For Each t In Array("Consultant", "Council", "Misc Fees", "Client Supply", "Cash Flow In", "Contractor")
+        If s = UCase(CStr(t)) Then CanonType = CStr(t): Exit Function
+    Next t
+    CanonType = ""
+End Function
 
 Private Function ReadSchemaVersion() As Long
     On Error Resume Next
@@ -194,7 +297,7 @@ Private Sub LogMacroNote(msg As String)
         RefersTo:="=""" & Replace(msg, """", """""") & """", Visible:=False
 End Sub
 
-' (Re)installs the COMMITTED Worksheet_Change guard watching col G.
+' (Re)installs the COMMITTED Worksheet_Change guard watching cols G:H.
 ' Mirrors tmp/install_retention_guard.py — keep the two in sync.
 Private Function InstallRetentionGuard() As Boolean
     On Error GoTo Fail
@@ -217,10 +320,10 @@ End Function
 Private Function GuardCode() As String
     Dim c As String
     c = "Private Sub Worksheet_Change(ByVal Target As Range)" & vbCrLf
-    c = c & "    ' Enforce: col G (RETENTIONS) only accepts values on Contractor rows." & vbCrLf
+    c = c & "    ' Enforce: cols G:H (RETENTIONS, RETENTION CAP) only accept values on Contractor rows." & vbCrLf
     c = c & "    ' Installed by modGenerateSchedule.EnsureSchema - do not edit here." & vbCrLf
     c = c & "    Dim isect As Range" & vbCrLf
-    c = c & "    Set isect = Application.Intersect(Target, Me.Range(""G2:G502""))" & vbCrLf
+    c = c & "    Set isect = Application.Intersect(Target, Me.Range(""G2:H502""))" & vbCrLf
     c = c & "    If isect Is Nothing Then Exit Sub" & vbCrLf
     c = c & "    Dim cell As Range, bad As Range" & vbCrLf
     c = c & "    For Each cell In isect" & vbCrLf
@@ -235,7 +338,7 @@ Private Function GuardCode() As String
     c = c & "        bad.ClearContents" & vbCrLf
     c = c & "        Application.EnableEvents = True" & vbCrLf
     c = c & "        If Application.Interactive Then" & vbCrLf
-    c = c & "            MsgBox ""Retention only applies to Contractor rows. Value cleared."", _" & vbCrLf
+    c = c & "            MsgBox ""Retention settings only apply to Contractor rows. Value cleared."", _" & vbCrLf
     c = c & "                   vbExclamation, ""Retention not allowed""" & vbCrLf
     c = c & "        End If" & vbCrLf
     c = c & "    End If" & vbCrLf
@@ -288,10 +391,10 @@ Public Sub GenerateSchedule()
     wsPay.Columns("C").ColumnWidth = 11.73
     wsPay.Columns("D").ColumnWidth = 11.73
     wsPay.Columns("E").ColumnWidth = 11.73
-    wsPay.Columns("F").ColumnWidth = 12.56
+    wsPay.Columns("F").ColumnWidth = 15    ' "LESS PREVIOUS" stays on one header line at 80-90% zoom
     wsPay.Columns("G").ColumnWidth = 11.73
     wsPay.Columns("H").ColumnWidth = 3.34
-    wsPay.Columns("I").ColumnWidth = 9.98
+    wsPay.Columns("I").ColumnWidth = 11    ' "COMMITTED" stays on one header line at 80-90% zoom
     wsPay.Columns("J").ColumnWidth = 18
     wsPay.Columns("K").ColumnWidth = 8
 
@@ -323,8 +426,9 @@ Public Sub GenerateSchedule()
         hasClaims = True
     End If
 
-    ' --- Read COMMITTED (7 columns: Type, Discipline, Company, FeeItem, Amount,
-    '     DateAppointed, Retention). Discipline (col B) is new in Update 3;
+    ' --- Read COMMITTED (8 columns: Type, Discipline, Company, FeeItem, Amount,
+    '     DateAppointed, Retention, RetentionCap). Retention Cap (col H) is new
+    '     in Update 4 (schema 6). Discipline (col B) is new in Update 3;
     '     pre-Update-3 workbooks have 6 columns in the old order — see the
     '     legacy-layout shim right below the read. ---
     Dim lastRowCF As Long
@@ -332,7 +436,7 @@ Public Sub GenerateSchedule()
     Dim feesArr() As Variant
     Dim hasFees As Boolean: hasFees = False
     If lastRowCF >= 2 Then
-        feesArr = wsCF.Range("A2:G" & lastRowCF).Value
+        feesArr = wsCF.Range("A2:H" & lastRowCF).Value
         hasFees = True
     End If
 
@@ -343,7 +447,7 @@ Public Sub GenerateSchedule()
     If hasFees Then
         If UCase(Trim(CStr(wsCF.Range("B1").Value))) <> "DISCIPLINE" Then
             Dim legacyArr() As Variant: legacyArr = feesArr
-            ReDim feesArr(1 To UBound(legacyArr, 1), 1 To 7)
+            ReDim feesArr(1 To UBound(legacyArr, 1), 1 To 8)
             Dim lgR As Long
             For lgR = 1 To UBound(legacyArr, 1)
                 feesArr(lgR, 1) = legacyArr(lgR, 1)   ' Type
@@ -353,22 +457,30 @@ Public Sub GenerateSchedule()
                 feesArr(lgR, 5) = legacyArr(lgR, 4)   ' Amount
                 feesArr(lgR, 6) = legacyArr(lgR, 5)   ' Date Appointed
                 feesArr(lgR, 7) = legacyArr(lgR, 6)   ' Retention
+                feesArr(lgR, 8) = Empty               ' Retention Cap (absent on legacy)
             Next lgR
         End If
     End If
 
-    ' --- Auto-fill fee types from FEES_ENTRY + CLAIM_ENTRY company->type lookup ---
+    ' Canonicalise every COMMITTED TYPE ("misc fees " -> "Misc Fees"); an
+    ' unrecognised value becomes "" and is auto-detected below
+    Dim ftIdx As Long
+    If hasFees Then
+        For ftIdx = 1 To UBound(feesArr, 1)
+            feesArr(ftIdx, 1) = CanonType(feesArr(ftIdx, 1))
+        Next ftIdx
+    End If
+
+    ' --- Auto-fill BLANK fee types from a company->type lookup ---
+    ' Item 15 (Update 4): this used to OVERWRITE every COMMITTED row's TYPE
+    ' with the company's first FEES_ENTRY type, so a Misc Fees row for a
+    ' consultant rolled into its committed block, and a contractor with a
+    ' Misc Fees invoice lost every row to Misc Fees. Now an explicit TYPE
+    ' always wins; only blank rows are filled, CLAIM_ENTRY (Contractor) first,
+    ' then FEES_ENTRY, first seen wins.
     If (hasData Or hasClaims) And hasFees Then
         Dim compTypeMap As Object: Set compTypeMap = CreateObject("Scripting.Dictionary")
-        Dim ctmIdx As Long
-        If hasData Then
-            For ctmIdx = 1 To UBound(dataArr, 1)
-                Dim cName As String: cName = CStr(dataArr(ctmIdx, 2))
-                If Len(cName) > 0 And Not compTypeMap.Exists(cName) Then
-                    compTypeMap.Add cName, CStr(dataArr(ctmIdx, 1))
-                End If
-            Next ctmIdx
-        End If
+        Dim ctmIdx As Long, cName As String
         If hasClaims Then
             For ctmIdx = 1 To UBound(claimArr, 1)
                 cName = CStr(claimArr(ctmIdx, 1))
@@ -377,10 +489,17 @@ Public Sub GenerateSchedule()
                 End If
             Next ctmIdx
         End If
-        Dim ftIdx As Long
+        If hasData Then
+            For ctmIdx = 1 To UBound(dataArr, 1)
+                cName = CStr(dataArr(ctmIdx, 2))
+                If Len(cName) > 0 And Not compTypeMap.Exists(cName) Then
+                    compTypeMap.Add cName, CStr(dataArr(ctmIdx, 1))
+                End If
+            Next ctmIdx
+        End If
         For ftIdx = 1 To UBound(feesArr, 1)
             Dim fComp As String: fComp = CStr(feesArr(ftIdx, 3))
-            If Len(fComp) > 0 And compTypeMap.Exists(fComp) Then
+            If Len(feesArr(ftIdx, 1)) = 0 And Len(fComp) > 0 And compTypeMap.Exists(fComp) Then
                 feesArr(ftIdx, 1) = compTypeMap(fComp)
             End If
         Next ftIdx
@@ -426,7 +545,11 @@ Public Sub GenerateSchedule()
     End If
 
     ' --- Per-contractor retention map (from COMMITTED col G) ---
+    ' and retention cap map (col H, Update 4): the first Contractor row per
+    ' name holding a positive number. Text (a stray label, the relocated
+    ' note) never reaches a formula.
     Dim ctrRet As Object: Set ctrRet = CreateObject("Scripting.Dictionary")
+    Dim ctrCap As Object: Set ctrCap = CreateObject("Scripting.Dictionary")
     If hasFees Then
         Dim crIdx As Long
         For crIdx = 1 To UBound(feesArr, 1)
@@ -436,6 +559,15 @@ Public Sub GenerateSchedule()
                     Dim crRt As String: crRt = Trim(CStr(feesArr(crIdx, 7)))
                     If Len(crRt) = 0 Then crRt = "Major Works"
                     ctrRet.Add crName, crRt
+                End If
+                If Len(crName) > 0 And Not ctrCap.Exists(crName) Then
+                    If Not IsError(feesArr(crIdx, 8)) And Not IsEmpty(feesArr(crIdx, 8)) Then
+                        If IsNumeric(feesArr(crIdx, 8)) Then
+                            If CDbl(feesArr(crIdx, 8)) > 0 Then
+                                ctrCap.Add crName, CDbl(feesArr(crIdx, 8))
+                            End If
+                        End If
+                    End If
                 End If
             End If
         Next crIdx
@@ -591,6 +723,10 @@ Public Sub GenerateSchedule()
         wsPay.Cells(curRow, 5).NumberFormatLocal =PCT_FMT
         wsPay.Cells(curRow, 9).Formula = "=SUBTOTAL(9,I" & mFirstFeeDataRow & ":I" & mLastFeeDataRow & ")"
         wsPay.Cells(curRow, 9).NumberFormatLocal =MONEY_FMT_WHOLE
+        ' Large bracketed totals render as hashes at 80-90% zoom in a fixed-width
+        ' column (print is fine). Shrink-to-fit adapts to the viewer's screen.
+        wsPay.Range(wsPay.Cells(curRow, 4), wsPay.Cells(curRow, 5)).ShrinkToFit = True
+        wsPay.Cells(curRow, 9).ShrinkToFit = True
         wsPay.Cells(curRow, 10).Value = "Total committed"
         wsPay.Cells(curRow, 9).Interior.Color = FEE_FILL
         wsPay.Cells(curRow, 9).Borders(xlEdgeLeft).LineStyle = xlContinuous: wsPay.Cells(curRow, 9).Borders(xlEdgeLeft).Weight = xlThin
@@ -791,52 +927,46 @@ Public Sub GenerateSchedule()
     End If ' showClientSupply
 
     ' =====================================================================
-    curSection = "CashFlow"
-    ' SECTION 8: CASH FLOW IN (forced page break)
-    ' =====================================================================
-    Dim cfRowCount As Long: cfRowCount = 0
-    For i = 1 To UBound(dataArr, 1)
-        If CStr(dataArr(i, 1)) = "Cash Flow In" Then cfRowCount = cfRowCount + 1
-    Next i
-    Dim cfFeeCountTotal As Long: cfFeeCountTotal = CountTypeFees(feesArr, hasFees, "Cash Flow In")
-
-    ' Track Cash Flow In total fee rows (for summary)
-    Dim cfTotalFeeRows() As Long
-    Dim cfCompanyCount As Long: cfCompanyCount = 0
-
-    If cfRowCount > 0 Or cfFeeCountTotal > 0 Then
-        curRow = curRow + 1
-        wsPay.HPageBreaks.Add Before:=wsPay.Cells(curRow, 1)
-        pageStartRow = curRow
-        WriteInvoiceHeader wsPay, curRow
-
-        ' Get Cash Flow In companies
-        Dim cfCompanies As Variant
-        cfCompanies = GetAllCompaniesForType(dataArr, feesArr, hasFees, "Cash Flow In", "")
-        If Not IsEmpty(cfCompanies) Then
-            ReDim cfTotalFeeRows(0 To UBound(cfCompanies))
-            For compIdx = LBound(cfCompanies) To UBound(cfCompanies)
-                If Len(cfCompanies(compIdx)) > 0 Then
-                    Dim cfTFR As Long: cfTFR = 0
-                    WriteStandardSection wsPay, dataArr, feesArr, hasFees, _
-                        CStr(cfCompanies(compIdx)), "Cash Flow In", _
-                        curRow, pageStartRow, compRowCounts, False, cfTFR
-                    cfTotalFeeRows(cfCompanyCount) = cfTFR
-                    cfCompanyCount = cfCompanyCount + 1
-                End If
-            Next compIdx
-        End If
-    End If
-
-    ' =====================================================================
     curSection = "Contractors"
-    ' SECTION 9: CONTRACTORS (forced page break for section, smart breaks within)
+    ' SECTION 8: CONTRACTORS (forced page break for section, smart breaks within)
     ' =====================================================================
+    ' Contractors = A-Z union of COMMITTED rows typed Contractor and
+    ' CLAIM_ENTRY col-A names (item 15: a claims-only or committed-only
+    ' contractor is always listed). CLAIM_ENTRY has no TYPE column, so
+    ' GetAllCompaniesForType cannot read names from it.
     Dim contractors As Variant
+    Dim ctrDict As Object: Set ctrDict = CreateObject("Scripting.Dictionary")
+    Dim cdIdx As Long, cdName As String
+    If hasFees Then
+        For cdIdx = 1 To UBound(feesArr, 1)
+            If CStr(feesArr(cdIdx, 1)) = "Contractor" Then
+                cdName = CStr(feesArr(cdIdx, 3))
+                If Len(cdName) > 0 And Not ctrDict.Exists(cdName) Then ctrDict.Add cdName, 0
+            End If
+        Next cdIdx
+    End If
     If hasClaims Then
-        contractors = GetAllCompaniesForType(claimArr, feesArr, hasFees, "Contractor", "")
-    Else
+        For cdIdx = 1 To UBound(claimArr, 1)
+            cdName = CStr(claimArr(cdIdx, 1))
+            If Len(cdName) > 0 And Not ctrDict.Exists(cdName) Then ctrDict.Add cdName, 0
+        Next cdIdx
+    End If
+    If ctrDict.Count = 0 Then
         contractors = Empty
+    Else
+        Dim ctrList() As String: ReDim ctrList(0 To ctrDict.Count - 1)
+        Dim cdKey As Variant: cdIdx = 0
+        For Each cdKey In ctrDict.Keys: ctrList(cdIdx) = CStr(cdKey): cdIdx = cdIdx + 1: Next cdKey
+        ' Bubble sort A-Z (same as GetAllCompaniesForType)
+        Dim cdJ As Long, cdSwap As String
+        For cdIdx = 0 To UBound(ctrList) - 1
+            For cdJ = 0 To UBound(ctrList) - cdIdx - 1
+                If ctrList(cdJ) > ctrList(cdJ + 1) Then
+                    cdSwap = ctrList(cdJ): ctrList(cdJ) = ctrList(cdJ + 1): ctrList(cdJ + 1) = cdSwap
+                End If
+            Next cdJ
+        Next cdIdx
+        contractors = ctrList
     End If
 
     If Not IsEmpty(contractors) Then
@@ -862,6 +992,9 @@ Public Sub GenerateSchedule()
             Else
                 retentionType = "Major Works"
             End If
+            ' ...and its retention cap (COMMITTED col H), 0 = no extra cap
+            Dim capVal As Double: capVal = 0
+            If ctrCap.Exists(contrName) Then capVal = ctrCap(contrName)
 
             ' Look-ahead: will this contractor fit on current page?
             Dim ctrInvCount As Long: ctrInvCount = 0
@@ -895,8 +1028,11 @@ Public Sub GenerateSchedule()
             ' baked in VBA. Reset per contractor.
             Dim relSumExpr As String: relSumExpr = ""
 
-            ' Write contractor progress payments from CLAIM_ENTRY
-            For i = 1 To UBound(claimArr, 1)
+            ' Write contractor progress payments from CLAIM_ENTRY (claimArr is
+            ' never dimensioned when CLAIM_ENTRY is empty: ctrClaimCnt = 0 skips it)
+            Dim ctrClaimCnt As Long: ctrClaimCnt = 0
+            If hasClaims Then ctrClaimCnt = UBound(claimArr, 1)
+            For i = 1 To ctrClaimCnt
                 If CStr(claimArr(i, 1)) = contrName Then
                     Dim isPaidCtr As Boolean
                     isPaidCtr = (UCase(Trim(CStr(claimArr(i, 5)))) = "Y")
@@ -943,22 +1079,37 @@ Public Sub GenerateSchedule()
                             relSumExpr = relSumExpr & "+" & thisRel
                         End If
                     End If
+                    ' Tier expression + type cap per retention type; the
+                    ' contractor's own cap (COMMITTED col H) is one more MIN
+                    ' argument, so it stays visible in the sheet formula.
+                    ' Without a cap the string is exactly the pre-Update-4 one.
+                    Dim tierExpr As String, typeCap As String, capPart As String
+                    capPart = ""
+                    If capVal > 0 Then capPart = "," & Trim$(Str$(capVal))
                     Select Case retentionType
                         Case "Minor Works"
-                            retFormula = "=0"
+                            tierExpr = ""
                         Case "Medium Works"
-                            retFormula = "=ROUND(MIN(IF(D" & curRow & "<200000,D" & curRow & "*0.05," & _
-                                         "10000+(D" & curRow & "-200000)*0.025),30000),2)"
+                            tierExpr = "IF(D" & curRow & "<200000,D" & curRow & "*0.05," & _
+                                       "10000+(D" & curRow & "-200000)*0.025)"
+                            typeCap = "30000"
                         Case "NZS3910"
                             ' Full NZ industry standard: 10% first $200K, 5% next $800K, 1.75% over $1M, capped at $200K
-                            retFormula = "=ROUND(MIN(IF(D" & curRow & "<200000,D" & curRow & "*0.1," & _
-                                         "IF(D" & curRow & "<1000000,20000+(D" & curRow & "-200000)*0.05," & _
-                                         "60000+(D" & curRow & "-1000000)*0.0175)),200000),2)"
+                            tierExpr = "IF(D" & curRow & "<200000,D" & curRow & "*0.1," & _
+                                       "IF(D" & curRow & "<1000000,20000+(D" & curRow & "-200000)*0.05," & _
+                                       "60000+(D" & curRow & "-1000000)*0.0175))"
+                            typeCap = "200000"
                         Case Else  ' Major Works (capped at $200,000) - half-rate variant
-                            retFormula = "=ROUND(MIN(IF(D" & curRow & "<200000,D" & curRow & "*0.05," & _
-                                         "IF(D" & curRow & "<1000000,10000+(D" & curRow & "-200000)*0.025," & _
-                                         "30000+(D" & curRow & "-1000000)*0.0087)),200000),2)"
+                            tierExpr = "IF(D" & curRow & "<200000,D" & curRow & "*0.05," & _
+                                       "IF(D" & curRow & "<1000000,10000+(D" & curRow & "-200000)*0.025," & _
+                                       "30000+(D" & curRow & "-1000000)*0.0087))"
+                            typeCap = "200000"
                     End Select
+                    If retentionType = "Minor Works" Then
+                        retFormula = "=0"
+                    Else
+                        retFormula = "=ROUND(MIN(" & tierExpr & "," & typeCap & capPart & "),2)"
+                    End If
                     ' Balance held = tier retention on cumulative work MINUS all
                     ' releases so far. One shape for every row (plain claims,
                     ' releases, combined claim+release), so released retention is
@@ -1035,6 +1186,44 @@ Public Sub GenerateSchedule()
             mContrTotalFeeRows(mContrCount) = ctrTotalFeeRow
             mContrCount = mContrCount + 1
         Next compIdx
+    End If
+
+    ' =====================================================================
+    curSection = "CashFlow"
+    ' SECTION 9: CASH FLOW IN (forced page break, after Contractors per Update 4 item 4)
+    ' =====================================================================
+    Dim cfRowCount As Long: cfRowCount = 0
+    For i = 1 To UBound(dataArr, 1)
+        If CStr(dataArr(i, 1)) = "Cash Flow In" Then cfRowCount = cfRowCount + 1
+    Next i
+    Dim cfFeeCountTotal As Long: cfFeeCountTotal = CountTypeFees(feesArr, hasFees, "Cash Flow In")
+
+    ' Track Cash Flow In total fee rows (for summary)
+    Dim cfTotalFeeRows() As Long
+    Dim cfCompanyCount As Long: cfCompanyCount = 0
+
+    If cfRowCount > 0 Or cfFeeCountTotal > 0 Then
+        curRow = curRow + 1
+        wsPay.HPageBreaks.Add Before:=wsPay.Cells(curRow, 1)
+        pageStartRow = curRow
+        WriteInvoiceHeader wsPay, curRow
+
+        ' Get Cash Flow In companies
+        Dim cfCompanies As Variant
+        cfCompanies = GetAllCompaniesForType(dataArr, feesArr, hasFees, "Cash Flow In", "")
+        If Not IsEmpty(cfCompanies) Then
+            ReDim cfTotalFeeRows(0 To UBound(cfCompanies))
+            For compIdx = LBound(cfCompanies) To UBound(cfCompanies)
+                If Len(cfCompanies(compIdx)) > 0 Then
+                    Dim cfTFR As Long: cfTFR = 0
+                    WriteStandardSection wsPay, dataArr, feesArr, hasFees, _
+                        CStr(cfCompanies(compIdx)), "Cash Flow In", _
+                        curRow, pageStartRow, compRowCounts, False, cfTFR
+                    cfTotalFeeRows(cfCompanyCount) = cfTFR
+                    cfCompanyCount = cfCompanyCount + 1
+                End If
+            Next compIdx
+        End If
     End If
 
     ' =====================================================================
@@ -1465,26 +1654,23 @@ Private Sub SortDataByDate(arr() As Variant)
 End Sub
 
 Private Sub SortFeesByDate(arr() As Variant)
-    ' Bubble sort fees by (Company col 3, Date col 6) — Update 3 COMMITTED layout
+    ' Stable bubble sort of COMMITTED rows (Update 3 layout) on a
+    ' lexicographic key, compared by FeeAfter:
+    '   group 0 (Consultant, Council, Contractor, Cash Flow In, other):
+    '     (Company col 3, Date col 6), undated before dated
+    '   group 1 (pooled sections, Misc Fees and Client Supply), after group 0:
+    '     (Date col 6) only, undated first, company ignored (Update 4 item 14:
+    '     pooled committed items render in Date Appointed order)
+    ' Equal keys never swap, so ties keep entry order. Group-0 rows keep
+    ' their relative order, and a company's group-0 rows now precede its
+    ' pooled rows, so the first-row-wins retention and discipline maps
+    ' (built after this) read the Consultant/Contractor row first.
     Dim n As Long: n = UBound(arr, 1)
     Dim i As Long, j As Long, c As Long
     Dim swap As Boolean
     For i = 1 To n - 1
         For j = 1 To n - i
-            swap = False
-            If CStr(arr(j, 3)) > CStr(arr(j + 1, 3)) Then
-                swap = True
-            ElseIf CStr(arr(j, 3)) = CStr(arr(j + 1, 3)) Then
-                ' Same company: sort by date (col 6), empty dates first
-                Dim d1Has As Boolean, d2Has As Boolean
-                d1Has = IsDate(arr(j, 6))
-                d2Has = IsDate(arr(j + 1, 6))
-                If d1Has And d2Has Then
-                    If CDate(arr(j, 6)) > CDate(arr(j + 1, 6)) Then swap = True
-                ElseIf d1Has And Not d2Has Then
-                    swap = True  ' dated items after undated
-                End If
-            End If
+            swap = FeeAfter(arr, j)
             If swap Then
                 For c = 1 To UBound(arr, 2)
                     Dim tmpF As Variant: tmpF = arr(j, c)
@@ -1495,6 +1681,38 @@ Private Sub SortFeesByDate(arr() As Variant)
         Next j
     Next i
 End Sub
+
+Private Function FeeAfter(arr As Variant, j As Long) As Boolean
+    ' True when COMMITTED row j must move below row j+1 (see SortFeesByDate).
+    ' Strict comparisons only: equal keys return False (stable sort).
+    Dim g1 As Long, g2 As Long
+    g1 = 0: g2 = 0
+    If CStr(arr(j, 1)) = "Misc Fees" Or CStr(arr(j, 1)) = "Client Supply" Then g1 = 1
+    If CStr(arr(j + 1, 1)) = "Misc Fees" Or CStr(arr(j + 1, 1)) = "Client Supply" Then g2 = 1
+    FeeAfter = False
+    If g1 <> g2 Then
+        FeeAfter = (g1 > g2)  ' group 0 first
+        Exit Function
+    End If
+    If g1 = 0 Then
+        ' Group 0: company first
+        If CStr(arr(j, 3)) > CStr(arr(j + 1, 3)) Then
+            FeeAfter = True
+            Exit Function
+        ElseIf CStr(arr(j, 3)) < CStr(arr(j + 1, 3)) Then
+            Exit Function
+        End If
+    End If
+    ' Same company (group 0) or pooled (group 1): date col 6, undated first
+    Dim d1Has As Boolean, d2Has As Boolean
+    d1Has = IsDate(arr(j, 6))
+    d2Has = IsDate(arr(j + 1, 6))
+    If d1Has And d2Has Then
+        If CDate(arr(j, 6)) > CDate(arr(j + 1, 6)) Then FeeAfter = True
+    ElseIf d1Has And Not d2Has Then
+        FeeAfter = True  ' dated items after undated
+    End If
+End Function
 
 ' ========================= COMPANY HELPERS ==================================
 
@@ -2020,6 +2238,7 @@ Private Sub FormatSummaryRow(ws As Worksheet, rowNum As Long, isHighlight As Boo
             .Borders(xlEdgeTop).LineStyle = xlContinuous: .Borders(xlEdgeTop).Weight = xlThin
             .Borders(xlEdgeBottom).LineStyle = xlContinuous: .Borders(xlEdgeBottom).Weight = xlThin
             .HorizontalAlignment = xlRight
+            .ShrinkToFit = True   ' summary totals fit at any zoom; these rows never wrap
             If isHighlight Then
                 .Interior.Color = HEADER_FILL
                 .Font.Color = BRAND_NAVY
